@@ -60,10 +60,9 @@ def next_trading_day() -> str:
     return d.strftime("%B %d, %Y")
 
 def get_action(z_score: float, dominance: bool = False) -> str:
-    """
-    Consistent action logic for both hero cards and tables.
-    """
     if dominance and z_score > 0.5:
+        return "STRONG BUY"
+    elif z_score > 1.0:
         return "STRONG BUY"
     elif z_score > 0.5:
         return "BUY"
@@ -206,25 +205,39 @@ with tab1:
 
         label = UNIVERSE_LABELS.get(universe_name, universe_name)
         benchmark = uni_data.get("benchmark", "SPY")
-        top_buys = uni_data.get("top_buys", [])
+        full_scores = uni_data.get("full_scores", {})
 
         st.markdown(f'<div class="uni-title">{label} — vs {benchmark}</div>', unsafe_allow_html=True)
 
+        # ── Check if there are any BUY signals ──────────────────────────────
+        buy_etfs = []
+        sell_etfs = []
+        
+        for ticker, data in full_scores.items():
+            z = safe_float(data.get("z_score", 0))
+            dom = data.get("dominance", False)
+            action = get_action(z, dom)
+            if "BUY" in action:
+                buy_etfs.append((ticker, z, data))
+            elif "SELL" in action:
+                sell_etfs.append((ticker, z, data))
+
+        # Sort by z-score
+        buy_etfs = sorted(buy_etfs, key=lambda x: x[1], reverse=True)
+        sell_etfs = sorted(sell_etfs, key=lambda x: x[1])
+
         # ── TOP BUYS ──────────────────────────────────────────────────────────
-        cols = st.columns(3)
-        for idx, etf in enumerate(top_buys[:3]):
-            ticker = etf["ticker"]
-            z_score = safe_float(etf.get("z_score", 0))
-            full_data = uni_data.get("full_scores", {}).get(ticker, {})
-            dominance = full_data.get("dominance", False)
-            best_window = full_data.get("best_window", "N/A")
-            e_value = safe_float(full_data.get("e_process_value", 1))
-            
-            # Use consistent action logic
-            action = get_action(z_score, dominance)
-            
-            with cols[idx]:
-                st.markdown(f"""
+        if buy_etfs:
+            st.markdown("#### 🟢 Top Buys")
+            cols = st.columns(3)
+            for idx, (ticker, z_score, data) in enumerate(buy_etfs[:3]):
+                dominance = data.get("dominance", False)
+                best_window = data.get("window", "N/A")
+                e_value = safe_float(data.get("e_process_value", 1))
+                action = get_action(z_score, dominance)
+                
+                with cols[idx]:
+                    st.markdown(f"""
 <div class="hero-card">
   <div class="ticker">⭐ {ticker}</div>
   <div class="score">z-score = {z_score:+.3f}</div>
@@ -235,13 +248,39 @@ with tab1:
   <div class="next-day">📅 {ntd}</div>
 </div>
 """, unsafe_allow_html=True)
+        else:
+            st.info("No BUY signals in this universe")
+
+        # ── TOP SELLS ──────────────────────────────────────────────────────────
+        if sell_etfs:
+            st.markdown("#### 🔴 Top Sells")
+            cols = st.columns(3)
+            for idx, (ticker, z_score, data) in enumerate(sell_etfs[:3]):
+                dominance = data.get("dominance", False)
+                best_window = data.get("window", "N/A")
+                e_value = safe_float(data.get("e_process_value", 1))
+                action = get_action(z_score, dominance)
+                
+                with cols[idx]:
+                    st.markdown(f"""
+<div class="hero-card" style="background:linear-gradient(135deg,#4a1a1a 0%,#6a2d2d 60%,#914040 100%);">
+  <div class="ticker">{ticker}</div>
+  <div class="score">z-score = {z_score:+.3f}</div>
+  <div class="score">{action_badge(action)}</div>
+  <div class="score">{dominance_badge(dominance)}</div>
+  <div class="score">E-process = {e_value:.2f}</div>
+  <div class="score">best window = {best_window}d</div>
+  <div class="next-day">📅 {ntd}</div>
+</div>
+""", unsafe_allow_html=True)
+        else:
+            st.info("No SELL signals in this universe")
 
         # ── FULL RANKING ──────────────────────────────────────────────────────
         with st.expander(f"📋 Full ranking — {label}"):
-            full = uni_data.get("full_scores", {})
-            if full:
+            if full_scores:
                 rows = []
-                for t, info in full.items():
+                for t, info in full_scores.items():
                     z = safe_float(info.get("z_score", 0))
                     dom = info.get("dominance", False)
                     action = get_action(z, dom)
@@ -250,7 +289,7 @@ with tab1:
                         "z-score": round(z, 4),
                         "E-process": round(safe_float(info.get("e_process_value", 1)), 2),
                         "Dominates": "✅" if dom else "❌",
-                        "Best Window (d)": info.get("best_window", "N/A"),
+                        "Best Window (d)": info.get("window", "N/A"),
                         "Action": action
                     })
                 df_rank = pd.DataFrame(rows).sort_values("z-score", ascending=False)
@@ -266,6 +305,8 @@ with tab1:
                     subset=['z-score']
                 )
                 st.dataframe(styled_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No data available")
         
         st.divider()
 
@@ -336,17 +377,17 @@ with tab2:
         benchmark = uni_data.get("benchmark", "SPY")
 
         # ── TOP BUYS ──────────────────────────────────────────────────────────
-        cols = st.columns(3)
-        for idx, etf in enumerate(win_data.get("top_buys", [])[:3]):
-            ticker = etf["ticker"]
-            z_score = safe_float(etf.get("z_score", 0))
-            
-            # For Tab 2, we don't have dominance info in the window data
-            # Use the z-score to determine action
-            action = get_action(z_score, False)
-            
-            with cols[idx]:
-                st.markdown(f"""
+        top_buys = win_data.get("top_buys", [])
+        if top_buys:
+            st.markdown("#### 🟢 Top Buys at this window")
+            cols = st.columns(3)
+            for idx, etf in enumerate(top_buys[:3]):
+                ticker = etf["ticker"]
+                z_score = safe_float(etf.get("z_score", 0))
+                action = get_action(z_score, False)
+                
+                with cols[idx]:
+                    st.markdown(f"""
 <div class="win-card">
   <div class="ticker">⭐ {ticker}</div>
   <div class="score">z-score = {z_score:+.3f}</div>
@@ -354,6 +395,8 @@ with tab2:
   <div class="next-day">window = {selected_win}d · vs {benchmark} · 📅 {ntd}</div>
 </div>
 """, unsafe_allow_html=True)
+        else:
+            st.info("No BUY signals at this window")
 
         # ── FULL RANKING ──────────────────────────────────────────────────────
         with st.expander(f"📋 Full ranking — {label} @ {selected_win}d"):
@@ -374,6 +417,8 @@ with tab2:
                     subset=['z-score']
                 )
                 st.dataframe(styled_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No ranking data available")
         
         st.divider()
 
