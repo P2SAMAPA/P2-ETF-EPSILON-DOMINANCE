@@ -44,6 +44,24 @@ def safe_float(val, default=0.0):
         return default
 
 
+def get_action(z_score: float, dominance: bool = False) -> str:
+    """
+    Consistent action logic used everywhere.
+    """
+    if dominance and z_score > 0.5:
+        return "STRONG BUY"
+    elif z_score > 1.0:
+        return "STRONG BUY"
+    elif z_score > 0.5:
+        return "BUY"
+    elif z_score > -0.5:
+        return "HOLD"
+    elif z_score > -1.0:
+        return "REDUCE"
+    else:
+        return "STRONG SELL"
+
+
 def process_window(args: Tuple) -> Dict:
     """
     Process a single window for all universes.
@@ -68,15 +86,18 @@ def process_window(args: Tuple) -> Dict:
                 "results": {}
             }
         
-        # Build window results
+        # Build window results with consistent actions
+        z_scores = {t: safe_float(r.get("z_score", 0)) for t, r in result.items()}
+        dominance = {t: r.get("dominance", False) for t, r in result.items()}
+        
         return {
             "window": window,
             "universe": universe_name,
             "benchmark": benchmark_ticker,
             "results": result,
-            "z_scores": {t: safe_float(r.get("z_score", 0)) for t, r in result.items()},
+            "z_scores": z_scores,
             "e_values": {t: safe_float(r.get("e_process_value", 1)) for t, r in result.items()},
-            "dominance": {t: r.get("dominance", False) for t, r in result.items()},
+            "dominance": dominance,
             "rejected": {t: r.get("rejected", False) for t, r in result.items()},
             "p_values": {t: safe_float(r.get("p_value", 1)) for t, r in result.items()},
             "error": None
@@ -208,13 +229,15 @@ def run_trainer(hf_token: Optional[str] = None) -> Dict:
                     best_win = window
                     best_data = wr["results"].get(ticker, {})
             if best_win is not None:
+                dominance = best_data.get("dominance", False)
                 best_window_per_etf[ticker] = {
                     "z_score": best_z,
                     "window": int(best_win),
                     "e_process_value": safe_float(best_data.get("e_process_value", 1)),
-                    "dominance": best_data.get("dominance", False),
+                    "dominance": dominance,
                     "rejected": best_data.get("rejected", False),
                     "p_value": safe_float(best_data.get("p_value", 1)),
+                    "action": get_action(best_z, dominance)
                 }
 
         # Top 5 buys (highest z-score = strong dominance)
@@ -234,19 +257,7 @@ def run_trainer(hf_token: Optional[str] = None) -> Dict:
             "benchmark": benchmark_ticker,
             "top_buys": [{"ticker": t, "z_score": z} for t, z in top_buys],
             "top_sells": [{"ticker": t, "z_score": z} for t, z in top_sells],
-            "full_scores": {
-                t: {
-                    "z_score": d["z_score"],
-                    "best_window": d["window"],
-                    "e_process_value": d["e_process_value"],
-                    "dominance": d["dominance"],
-                    "rejected": d["rejected"],
-                    "p_value": d["p_value"],
-                    "action": "BUY" if d["dominance"] and d["z_score"] > 0.5 else 
-                              "HOLD" if -0.5 <= d["z_score"] <= 0.5 else "SELL"
-                }
-                for t, d in best_window_per_etf.items()
-            }
+            "full_scores": best_window_per_etf
         }
 
         # ── Build Tab 2 (Per-Window Breakdown) ───────────────────────────────
@@ -259,9 +270,11 @@ def run_trainer(hf_token: Optional[str] = None) -> Dict:
                         for t, z in sorted(wr["z_scores"].items(), key=lambda x: x[1], reverse=True)[:5]
                     ],
                     "full_ranking": [
-                        [t, wr["z_scores"].get(t, 0), 
-                         "BUY" if wr["dominance"].get(t, False) and wr["z_scores"].get(t, 0) > 0.5 else 
-                         "SELL" if wr["z_scores"].get(t, 0) < -0.5 else "HOLD"]
+                        [
+                            t,
+                            wr["z_scores"].get(t, 0),
+                            get_action(wr["z_scores"].get(t, 0), wr["dominance"].get(t, False))
+                        ]
                         for t in available if t != benchmark_ticker
                     ]
                 }
