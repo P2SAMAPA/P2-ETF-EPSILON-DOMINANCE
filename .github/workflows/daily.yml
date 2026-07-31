@@ -1,0 +1,29 @@
+name: Daily Epsilon-Dominance Run
+
+on:
+  schedule:
+    - cron: '40 23 * * 1-6'
+  workflow_dispatch:
+
+jobs:
+  run-epsilon-dominance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run Epsilon-Dominance Engine
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python trainer.py
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: epsilon-dominance-results
+          path: |
+            epsilon_dominance_*.json
+            epsilon_dominance_breakdown_*.json
