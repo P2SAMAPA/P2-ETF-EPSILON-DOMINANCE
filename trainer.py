@@ -3,6 +3,8 @@ trainer.py  —  Orchestrator for Epsilon-Dominance Engine
 =========================================================
 
 Loads data → computes E-processes → ranks ETFs → builds JSON → uploads.
+
+Uses parallel processing for multi-window computation.
 """
 
 import os
@@ -10,7 +12,9 @@ import sys
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
@@ -40,8 +44,54 @@ def safe_float(val, default=0.0):
         return default
 
 
+def process_window(args: Tuple) -> Dict:
+    """
+    Process a single window for all universes.
+    This function is designed to run in parallel.
+    """
+    window, universe_name, available, prices_df, benchmark_ticker, engine_config = args
+    
+    logger.info(f"   Processing window {window}d for {universe_name}...")
+    
+    # Get price data for available tickers
+    universe_prices = prices_df[available]
+    
+    try:
+        # Compute dominance for this universe and window
+        result = compute_universe_dominance(universe_prices, benchmark_ticker, engine_config, window)
+        
+        if "error" in result:
+            return {
+                "window": window,
+                "universe": universe_name,
+                "error": result["error"],
+                "results": {}
+            }
+        
+        # Build window results
+        return {
+            "window": window,
+            "universe": universe_name,
+            "benchmark": benchmark_ticker,
+            "results": result,
+            "z_scores": {t: safe_float(r.get("z_score", 0)) for t, r in result.items()},
+            "e_values": {t: safe_float(r.get("e_process_value", 1)) for t, r in result.items()},
+            "dominance": {t: r.get("dominance", False) for t, r in result.items()},
+            "rejected": {t: r.get("rejected", False) for t, r in result.items()},
+            "p_values": {t: safe_float(r.get("p_value", 1)) for t, r in result.items()},
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "window": window,
+            "universe": universe_name,
+            "error": str(e),
+            "results": {}
+        }
+
+
 def run_trainer(hf_token: Optional[str] = None) -> Dict:
-    """Run the full Epsilon-Dominance pipeline."""
+    """Run the full Epsilon-Dominance pipeline with parallel processing."""
     token = hf_token or config.HF_TOKEN or os.environ.get("HF_TOKEN")
     if not token:
         logger.warning("HF_TOKEN not set — will skip HuggingFace upload.")
@@ -71,46 +121,77 @@ def run_trainer(hf_token: Optional[str] = None) -> Dict:
     results_tab1 = {"run_date": run_date, "universes": {}}
     results_tab2 = {"run_date": run_date, "universes": {}}
 
-    # ── Process each universe ─────────────────────────────────────────────────
+    # ── Prepare parallel tasks ───────────────────────────────────────────────
+    tasks = []
+    windows = config.WINDOWS
+    
+    # Get max workers (use 75% of available cores to leave room)
+    max_workers = max(1, int(mp.cpu_count() * 0.75))
+    logger.info(f"🚀 Using {max_workers} parallel workers for {len(windows)} windows × {len(config.UNIVERSES)} universes")
+
     for universe_name, tickers in config.UNIVERSES.items():
-        logger.info(f"\n📊 Processing universe: {universe_name}")
-
         available = [t for t in tickers if t in prices_df.columns]
-        logger.info(f"   Available: {len(available)}/{len(tickers)}")
-
         if not available:
             continue
 
         # Use first available as benchmark (or SPY if available)
         benchmark_ticker = "SPY" if "SPY" in available else available[0]
-        logger.info(f"   Benchmark: {benchmark_ticker}")
+        logger.info(f"📊 Universe: {universe_name} — Benchmark: {benchmark_ticker} ({len(available)} ETFs)")
 
-        # ── Compute for each window ───────────────────────────────────────────
-        window_results = {}
-        all_z_scores = {}
+        for window in windows:
+            tasks.append((window, universe_name, available, prices_df, benchmark_ticker, engine_config))
 
-        for window in config.WINDOWS:
-            logger.info(f"   Computing window: {window}d...")
+    # ── Run parallel processing ──────────────────────────────────────────────
+    logger.info(f"📋 Total tasks: {len(tasks)}")
+    
+    # Store all results
+    all_window_results = {}
+    
+    # Use ProcessPoolExecutor for parallel execution
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_task = {executor.submit(process_window, task): task for task in tasks}
+        
+        # Process results as they complete
+        completed = 0
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            try:
+                result = future.result(timeout=3600)  # 1 hour timeout per task
+                completed += 1
+                
+                if result.get("error"):
+                    logger.warning(f"   ⚠️ Window {result['window']}d for {result['universe']} failed: {result['error']}")
+                    continue
+                
+                # Store result
+                key = f"{result['universe']}_{result['window']}"
+                all_window_results[key] = result
+                
+                logger.info(f"   ✅ [{completed}/{len(tasks)}] {result['universe']} @ {result['window']}d — {len(result.get('z_scores', {}))} ETFs")
+                
+            except Exception as e:
+                logger.error(f"   ❌ Task failed: {e}")
+                completed += 1
 
-            # Get price data for available tickers
-            universe_prices = prices_df[available]
+    logger.info(f"✅ Completed {completed}/{len(tasks)} tasks")
 
-            # Compute dominance
-            result = compute_universe_dominance(universe_prices, benchmark_ticker, engine_config, window)
+    # ── Build results from parallel output ────────────────────────────────────
+    for universe_name in config.UNIVERSES.keys():
+        available = [t for t in config.UNIVERSES[universe_name] if t in prices_df.columns]
+        if not available:
+            continue
 
-            if "error" in result:
-                logger.warning(f"   Error: {result['error']}")
-                continue
+        benchmark_ticker = "SPY" if "SPY" in available else available[0]
 
-            # Build window results
-            window_results[str(window)] = {
-                "results": result,
-                "z_scores": {t: safe_float(r.get("z_score", 0)) for t, r in result.items()},
-                "e_values": {t: safe_float(r.get("e_process_value", 1)) for t, r in result.items()},
-                "dominance": {t: r.get("dominance", False) for t, r in result.items()},
-                "rejected": {t: r.get("rejected", False) for t, r in result.items()},
-                "p_values": {t: safe_float(r.get("p_value", 1)) for t, r in result.items()},
-            }
+        # Collect results for this universe
+        universe_window_results = {}
+        for key, result in all_window_results.items():
+            if result.get("universe") == universe_name:
+                universe_window_results[str(result["window"])] = result
+
+        if not universe_window_results:
+            continue
 
         # ── Build Tab 1 (Best Window per ETF) ────────────────────────────────
         best_window_per_etf = {}
@@ -120,7 +201,7 @@ def run_trainer(hf_token: Optional[str] = None) -> Dict:
             best_z = -999
             best_win = None
             best_data = None
-            for window, wr in window_results.items():
+            for window, wr in universe_window_results.items():
                 z = safe_float(wr["z_scores"].get(ticker, -999))
                 if z > best_z:
                     best_z = z
@@ -136,14 +217,14 @@ def run_trainer(hf_token: Optional[str] = None) -> Dict:
                     "p_value": safe_float(best_data.get("p_value", 1)),
                 }
 
-        # Top 5 buys (highest E-process value = strong dominance)
+        # Top 5 buys (highest z-score = strong dominance)
         top_buys = sorted(
             [(t, d["z_score"]) for t, d in best_window_per_etf.items()],
             key=lambda x: x[1],
             reverse=True
         )[:5]
 
-        # Top 5 sells (lowest E-process value = no dominance)
+        # Top 5 sells (lowest z-score = no dominance)
         top_sells = sorted(
             [(t, d["z_score"]) for t, d in best_window_per_etf.items()],
             key=lambda x: x[1]
@@ -184,7 +265,7 @@ def run_trainer(hf_token: Optional[str] = None) -> Dict:
                         for t in available if t != benchmark_ticker
                     ]
                 }
-                for window, wr in window_results.items()
+                for window, wr in universe_window_results.items()
             }
         }
 
