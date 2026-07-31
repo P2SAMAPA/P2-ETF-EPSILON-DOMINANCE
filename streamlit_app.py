@@ -59,6 +59,21 @@ def next_trading_day() -> str:
         d += timedelta(days=1)
     return d.strftime("%B %d, %Y")
 
+def get_action(z_score: float, dominance: bool = False) -> str:
+    """
+    Consistent action logic for both hero cards and tables.
+    """
+    if dominance and z_score > 0.5:
+        return "STRONG BUY"
+    elif z_score > 0.5:
+        return "BUY"
+    elif z_score > -0.5:
+        return "HOLD"
+    elif z_score > -1.0:
+        return "REDUCE"
+    else:
+        return "STRONG SELL"
+
 def action_badge(action: str) -> str:
     if "BUY" in action:
         return f'<span class="badge-buy">🟢 {action}</span>'
@@ -201,10 +216,12 @@ with tab1:
             ticker = etf["ticker"]
             z_score = safe_float(etf.get("z_score", 0))
             full_data = uni_data.get("full_scores", {}).get(ticker, {})
-            action = full_data.get("action", "HOLD")
-            best_window = full_data.get("best_window", "N/A")
             dominance = full_data.get("dominance", False)
+            best_window = full_data.get("best_window", "N/A")
             e_value = safe_float(full_data.get("e_process_value", 1))
+            
+            # Use consistent action logic
+            action = get_action(z_score, dominance)
             
             with cols[idx]:
                 st.markdown(f"""
@@ -225,13 +242,16 @@ with tab1:
             if full:
                 rows = []
                 for t, info in full.items():
+                    z = safe_float(info.get("z_score", 0))
+                    dom = info.get("dominance", False)
+                    action = get_action(z, dom)
                     rows.append({
                         "ETF": t,
-                        "z-score": round(safe_float(info.get("z_score", 0)), 4),
+                        "z-score": round(z, 4),
                         "E-process": round(safe_float(info.get("e_process_value", 1)), 2),
-                        "Dominates": "✅" if info.get("dominance", False) else "❌",
+                        "Dominates": "✅" if dom else "❌",
                         "Best Window (d)": info.get("best_window", "N/A"),
-                        "Action": info.get("action", "HOLD")
+                        "Action": action
                     })
                 df_rank = pd.DataFrame(rows).sort_values("z-score", ascending=False)
                 
@@ -321,12 +341,16 @@ with tab2:
             ticker = etf["ticker"]
             z_score = safe_float(etf.get("z_score", 0))
             
+            # For Tab 2, we don't have dominance info in the window data
+            # Use the z-score to determine action
+            action = get_action(z_score, False)
+            
             with cols[idx]:
                 st.markdown(f"""
 <div class="win-card">
   <div class="ticker">⭐ {ticker}</div>
   <div class="score">z-score = {z_score:+.3f}</div>
-  <div class="score"><span class="badge-buy">BUY</span></div>
+  <div class="score">{action_badge(action)}</div>
   <div class="next-day">window = {selected_win}d · vs {benchmark} · 📅 {ntd}</div>
 </div>
 """, unsafe_allow_html=True)
